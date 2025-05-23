@@ -1,24 +1,19 @@
 const express = require('express');
 const bodyParser = require('body-parser');
-const dialogflow = require('@google-cloud/dialogflow');
 const uuid = require('uuid');
-require('dotenv').config(); // Carga las variables del .env
+const sessionClient = require('./dialogflowClient');
+require('dotenv').config();
 
 const app = express();
 const port = process.env.PORT || 3000;
+const projectId = process.env.DIALOGFLOW_PROJECT_ID;
+const languageCode = 'es';
 
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-const projectId = process.env.DIALOGFLOW_PROJECT_ID;
-const sessionClient = new dialogflow.SessionsClient({
-  keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS,
-});
-
 app.post('/webhook', async (req, res) => {
   const userMessage = req.body.Body;
-  const fromNumber = req.body.From;
-
   const sessionId = uuid.v4();
   const sessionPath = sessionClient.projectAgentSessionPath(projectId, sessionId);
 
@@ -27,7 +22,7 @@ app.post('/webhook', async (req, res) => {
     queryInput: {
       text: {
         text: userMessage,
-        languageCode: 'es',
+        languageCode: languageCode,
       },
     },
   };
@@ -35,8 +30,7 @@ app.post('/webhook', async (req, res) => {
   try {
     const responses = await sessionClient.detectIntent(request);
     const result = responses[0].queryResult;
-
-    const reply = result.fulfillmentText || "No tengo una respuesta para eso.";
+    const reply = result.fulfillmentText || 'No tengo una respuesta para eso.';
 
     const twiml = `
       <Response>
@@ -46,12 +40,12 @@ app.post('/webhook', async (req, res) => {
 
     res.set('Content-Type', 'text/xml');
     res.send(twiml);
-  } catch (err) {
-    console.error('ERROR:', err);
-    res.status(500).send('Error procesando la solicitud');
+  } catch (error) {
+    console.error('Error al enviar mensaje a Dialogflow:', error);
+    res.status(500).send('Error interno del servidor');
   }
 });
 
 app.listen(port, () => {
-  console.log(`Webhook de WhatsApp + Dialogflow escuchando en el puerto ${port}`);
+  console.log(`Servidor escuchando en puerto ${port}`);
 });
