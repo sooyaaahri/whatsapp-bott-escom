@@ -15,8 +15,12 @@ app.use(bodyParser.json());
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const projectId = process.env.DIALOGFLOW_PROJECT_ID;
+const credentials = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
 const sessionClient = new dialogflow.SessionsClient({
-    keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+    credentials: {
+        client_email: credentials.client_email,
+        private_key: credentials.private_key,
+    },
 });
 
 app.post('/webhook', async (req, res) => {
