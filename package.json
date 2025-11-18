@@ -18,11 +18,12 @@
   },
   "homepage": "https://github.com/sooyaaahri/whatsapp-bott-escom#readme",
   "dependencies": {
-    "@google-cloud/dialogflow": "^7.0.1",
+    "@google-cloud/dialogflow": "^7.4.0",
+    "@supabase/supabase-js": "^2.83.0",
     "body-parser": "^2.2.0",
-    "dotenv": "^16.5.0",
+    "dotenv": "^16.6.1",
     "express": "^5.1.0",
-    "supabase": "^2.58.5",
+    "openai": "^6.9.1",
     "uuid": "^11.1.0"
   }
 }
