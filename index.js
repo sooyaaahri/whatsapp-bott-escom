@@ -1,21 +1,17 @@
-// server.js (Código Unificado)
 require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const dialogflow = require('@google-cloud/dialogflow');
-const uuid = require('uuid'); // Se mantiene, aunque usaremos fromNumber como sessionId para memoria
+const uuid = require('uuid'); 
 const { createClient } = require('@supabase/supabase-js');
 const { OpenAI } = require('openai');
 
-// --- 1. Inicialización de Clientes ---
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Middleware (Tu configuración original)
 app.use(bodyParser.urlencoded({ extended: false }));
 app.use(bodyParser.json());
 
-// Clientes para las APIs
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const projectId = process.env.DIALOGFLOW_PROJECT_ID;
@@ -23,19 +19,20 @@ const sessionClient = new dialogflow.SessionsClient({
     keyFilename: process.env.GOOGLE_APPLICATION_CREDENTIALS,
 });
 
-// --- 2. WEBHOOK de WhatsApp (Twilio Original) ---
 app.post('/webhook', async (req, res) => {
     const userMessage = req.body.Body;
-    const fromNumber = req.body.From; // Usado como senderId
+    const fromNumber = req.body.From;
+
+    console.log(`[INICIO] Mensaje de ${fromNumber}: "${userMessage.substring(0, 50)}..."`);
 
     try {
-        // LLAMADA CLAVE: La orquestación completa de RAG/Dialogflow
         const finalReply = await handleConversation(userMessage, fromNumber);
         
-        // --- RESPUESTA TWILIO (Tu formato original, sin cambios) ---
         const twimlReply = (finalReply === 'HANDOFF_TO_HUMAN')
             ? "Lo siento, la consulta requiere asistencia humana. Un agente se pondrá en contacto pronto."
             : finalReply;
+
+        console.log(`[FIN] Respuesta final: "${twimlReply.substring(0, 50)}..."`);
 
         const twiml = `
             <Response>
@@ -45,10 +42,9 @@ app.post('/webhook', async (req, res) => {
 
         res.set('Content-Type', 'text/xml');
         res.send(twiml);
-        // -----------------------------------------------------------
 
     } catch (err) {
-        console.error('ERROR EN EL PROCESO RAG:', err);
+        console.error('ERROR CRÍTICO EN EL PROCESO RAG/WEBHOOK:', err);
         res.status(500).send('<Response><Message>Error interno del sistema.</Message></Response>');
     }
 });
@@ -58,38 +54,30 @@ app.listen(port, () => {
 });
 
 
-// --- 3. Funciones del Cerebro (Lógica RAG) ---
-
-/**
- * ORQUESTADOR: Maneja el flujo de Dialogflow -> RAG (Supabase + OpenAI)
- */
 async function handleConversation(query, senderId) {
     
-    // 1. FILTRO DIALOGFLOW
     const dialogflowResponse = await checkDialogflow(query, senderId);
+    console.log(`[ORQUESTADOR] Dialogflow Intent: ${dialogflowResponse.intent}`);
     
     if (dialogflowResponse.intent !== 'Default Fallback Intent') {
-        return dialogflowResponse.text; // Respuesta rápida de Dialogflow
+        return dialogflowResponse.text; 
     }
+    
+    console.log('[ORQUESTADOR] Dialogflow Fallback. Activando RAG...');
 
-    // 2. FALLBACK RAG 
     const context = await getRagContext(query);
     
     if (context) {
-        // La función generateAiResponse devuelve el token HANDOFF_TO_HUMAN si no hay respuesta.
+        console.log(`[ORQUESTADOR] Contexto RAG encontrado (${context.length} chars). Llamando a OpenAI...`);
         return await generateAiResponse(query, context);
     }
-
-    // 3. RESPUESTA FINAL SI NADA FUNCIONA (Transferencia a humano)
+    
+    console.log('[ORQUESTADOR] RAG Fallback. No se encontró contexto.');
     return "HANDOFF_TO_HUMAN";
 }
 
 
-/**
- * FILTRO DE BAJA LATENCIA (Dialogflow)
- */
 async function checkDialogflow(query, senderId) {
-    // Usamos el senderId (número de WhatsApp) como Session ID para mantener la conversación
     const sessionPath = sessionClient.projectAgentSessionPath(projectId, senderId.replace('whatsapp:', ''));
     
     const request = { 
@@ -116,29 +104,34 @@ async function checkDialogflow(query, senderId) {
 }
 
 
-/**
- * BÚSQUEDA DE CONTEXTO (Supabase RPC)
- */
 async function getRagContext(query) {
     
-    // 1. GENERAR EMBEDDING (Vector)
-    const embeddingResponse = await openai.embeddings.create({
-        model: "text-embedding-3-small", 
-        input: query,
-    });
-    const queryEmbedding = embeddingResponse.data[0].embedding;
-
-    // 2. LLAMAR A LA FUNCIÓN PL/PGSQL (RPC)
     try {
-        const { data: knowledgeChunks } = await supabase.rpc('match_knowledge', {
+        const embeddingResponse = await openai.embeddings.create({
+            model: "text-embedding-3-small", 
+            input: query,
+        });
+        const queryEmbedding = embeddingResponse.data[0].embedding;
+        console.log('[RAG] Embedding generado. Consultando RPC...');
+
+        const { data: knowledgeChunks, error } = await supabase.rpc('match_knowledge', {
             query_embedding: queryEmbedding,
-            match_threshold: 0.75, // Ajustado para ser estricto
+            match_threshold: 0.75, 
             match_count: 3,        
         });
+        
+        if (error) {
+            console.error('ERROR RPC SUPABASE:', error);
+            return null;
+        }
 
-        if (!knowledgeChunks || knowledgeChunks.length === 0) return null;
+        if (!knowledgeChunks || knowledgeChunks.length === 0) {
+            console.log('[RAG] RPC OK. Resultado: 0 chunks encontrados.');
+            return null;
+        }
 
-        // Formateamos los resultados para el prompt
+        console.log(`[RAG] RPC OK. Chunks encontrados: ${knowledgeChunks.length}`);
+
         const context = knowledgeChunks.map(chunk => 
             `Título: ${chunk.source_title}\nContenido: ${chunk.content}`
         ).join('\n---\n');
@@ -146,33 +139,32 @@ async function getRagContext(query) {
         return context;
 
     } catch (e) {
-        console.error("Error en RAG/Supabase:", e);
+        console.error("ERROR EN RAG/SUPABASE:", e);
         return null;
     }
 }
 
 
-/**
- * GENERACIÓN DE RESPUESTA (OpenAI con Prompt Estricto)
- */
 async function generateAiResponse(query, context) {
     const systemPrompt = `Eres un experto de soporte. Responde la pregunta del cliente usando ÚNICAMENTE el CONTEXTO proporcionado. REGLA ESTRICTA: Si no puedes responder con el contexto, responde ÚNICAMENTE con la frase: "HANDOFF_TO_HUMAN". CONTEXTO DISPONIBLE: ---\n${context}\n---`;
 
     try {
         const response = await openai.chat.completions.create({
-            model: "gpt-4o-mini", // Rápido y económico
+            model: "gpt-4o-mini", 
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: query },
             ],
-            temperature: 0.1, // Baja temperatura para consistencia
+            temperature: 0.1, 
             max_tokens: 300,
         });
 
-        return response.choices[0].message.content.trim();
+        const aiResponse = response.choices[0].message.content.trim();
+        console.log(`[OpenAI] Respuesta generada. ¿Transferencia?: ${aiResponse === 'HANDOFF_TO_HUMAN' ? 'Sí' : 'No'}`);
+        return aiResponse;
 
     } catch (e) {
-        console.error("Error llamando a OpenAI:", e);
+        console.error("ERROR LLAMANDO A OPENAI:", e);
         return "Hubo un error al consultar la IA.";
     }
 }
