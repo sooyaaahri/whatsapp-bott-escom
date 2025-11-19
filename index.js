@@ -32,17 +32,15 @@ app.post('/webhook', async (req, res) => {
     try {
         const finalReply = await handleConversation(userMessage, fromNumber);
         
+        // Manejo del token de transferencia a humano
         const twimlReply = (finalReply === 'HANDOFF_TO_HUMAN')
             ? "Lo siento, la consulta requiere asistencia humana. Un agente se pondrá en contacto pronto."
             : finalReply;
 
         console.log(`[FIN] Respuesta final: "${twimlReply.substring(0, 50)}..."`);
 
-        const twiml = `
-            <Response>
-                <Message>${twimlReply}</Message>
-            </Response>
-        `;
+        // Respuesta TwiML XML (Formato Twilio Original)
+        const twiml = `<Response><Message>${twimlReply}</Message></Response>`;
 
         res.set('Content-Type', 'text/xml');
         res.send(twiml);
@@ -53,11 +51,39 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
+/**
+ * 2.2 RUTA DE INGESTA (Disparada por Retool al subir un documento)
+ */
+app.post('/ingest-document', async (req, res) => {
+    const documentId = req.body.id;
+    
+    if (!documentId) {
+        console.error('[INGESTA ERROR] Solicitud de ingesta sin ID de documento.');
+        return res.status(400).send({ message: 'Missing document ID.' });
+    }
+
+    // CRÍTICO: Ejecutar la función de ingesta en segundo plano (no usar await)
+    // Esto permite que Node.js responda inmediatamente a Retool.
+    processAndChunkDocument(documentId); 
+
+    // Responder inmediatamente con 202 Accepted.
+    res.status(202).send({ message: `Ingesta iniciada para el documento ${documentId}. El procesamiento continuará en segundo plano.` });
+});
+
+
+// --- 3. Inicio del Servidor ---
 app.listen(port, () => {
     console.log(`Webhook de WhatsApp + Dialogflow + RAG escuchando en el puerto ${port}`);
 });
 
 
+// =========================================================================
+//                  LÓGICA DEL CEREBRO (CONVERSACIÓN)
+// =========================================================================
+
+/**
+ * ORQUESTADOR: Maneja el flujo de Dialogflow -> RAG (Supabase + OpenAI)
+ */
 async function handleConversation(query, senderId) {
     
     const dialogflowResponse = await checkDialogflow(query, senderId);
@@ -81,6 +107,9 @@ async function handleConversation(query, senderId) {
 }
 
 
+/**
+ * FILTRO DE BAJA LATENCIA (Dialogflow)
+ */
 async function checkDialogflow(query, senderId) {
     const sessionPath = sessionClient.projectAgentSessionPath(projectId, senderId.replace('whatsapp:', ''));
     
@@ -108,6 +137,9 @@ async function checkDialogflow(query, senderId) {
 }
 
 
+/**
+ * BÚSQUEDA DE CONTEXTO (Supabase RPC)
+ */
 async function getRagContext(query) {
     
     try {
@@ -149,6 +181,9 @@ async function getRagContext(query) {
 }
 
 
+/**
+ * GENERACIÓN DE RESPUESTA (OpenAI con Prompt Estricto)
+ */
 async function generateAiResponse(query, context) {
     const systemPrompt = `Eres un experto de soporte. Responde la pregunta del cliente usando ÚNICAMENTE el CONTEXTO proporcionado. REGLA ESTRICTA: Si no puedes responder con el contexto, responde ÚNICAMENTE con la frase: "HANDOFF_TO_HUMAN". CONTEXTO DISPONIBLE: ---\n${context}\n---`;
 
@@ -170,5 +205,105 @@ async function generateAiResponse(query, context) {
     } catch (e) {
         console.error("ERROR LLAMANDO A OPENAI:", e);
         return "Hubo un error al consultar la IA.";
+    }
+}
+
+// =========================================================================
+//                  LÓGICA DE INGESTA (ASÍNCRONA)
+// =========================================================================
+
+/**
+ * Orquesta la descarga, fragmentación, vectorización e inserción de un documento.
+ */
+async function processAndChunkDocument(documentId) {
+    console.log(`[INGESTA] INICIANDO proceso para el documento ID: ${documentId}`);
+    
+    // 1. OBTENER METADATOS Y CONTENIDO
+    const { data: source, error: sourceError } = await supabase
+        .from('content_sources')
+        .select('*')
+        .eq('id', documentId)
+        .single();
+
+    if (sourceError || !source) {
+        console.error(`[INGESTA ERROR] No se pudo obtener la fuente ${documentId}:`, sourceError);
+        return;
+    }
+
+    let fullText = '';
+    const SOURCE_TITLE = source.title;
+    
+    if (source.source_type === 'text') {
+        fullText = source.original_content;
+    } 
+    else if (source.source_type === 'file' && source.file_path) {
+        try {
+            console.log(`[INGESTA] Tipo 'file' detectado. Descargando desde: ${source.file_path}`);
+            
+            // Lógica para descargar PDF y parsear... (Asumimos que el bucket es 'knowledge-docs')
+            const { data: fileData } = await supabase.storage.from('knowledge-docs').download(source.file_path);
+            const dataBuffer = await fileData.arrayBuffer();
+            const pdfData = await pdf(Buffer.from(dataBuffer));
+            fullText = pdfData.text;
+            
+        } catch (downloadOrParseError) {
+            console.error('[INGESTA ERROR] Fallo al descargar o parsear PDF:', downloadOrParseError);
+            return;
+        }
+    } else {
+        console.error(`[INGESTA ERROR] Tipo de fuente desconocido o ruta de archivo faltante.`);
+        return;
+    }
+
+    if (!fullText) return console.log('[INGESTA] Texto vacío. Cancelando.');
+    
+    // 2. CHUNKING (Fragmentación del Texto)
+    const chunks = simpleChunker(fullText, 1000, 200);
+    console.log(`[INGESTA] Texto dividido en ${chunks.length} fragmentos.`);
+    
+    // 3. GENERACIÓN DE EMBEDDINGS E INSERCIÓN
+    await insertChunksWithEmbeddings(documentId, SOURCE_TITLE, chunks);
+    
+    console.log(`[INGESTA] FINALIZADO el proceso para el documento ID: ${documentId}`);
+}
+
+function simpleChunker(text, chunkSize, overlap) {
+    const chunks = [];
+    for (let i = 0; i < text.length; i += chunkSize - overlap) {
+        chunks.push(text.substring(i, i + chunkSize));
+    }
+    return chunks;
+}
+
+async function insertChunksWithEmbeddings(sourceId, sourceTitle, chunks) {
+    const { error: deleteError } = await supabase.from('content_chunks').delete().eq('source_id', sourceId);
+    if (deleteError) console.error('[INGESTA ERROR] No se pudieron eliminar chunks viejos:', deleteError);
+    
+    console.log(`[INGESTA] Eliminados chunks previos para source_id: ${sourceId}`);
+
+    for (const [index, chunk] of chunks.entries()) {
+        try {
+            const embeddingResponse = await openai.embeddings.create({
+                model: "text-embedding-3-small",
+                input: chunk.replace(/\n/g, ' '),
+            });
+            const embedding = embeddingResponse.data[0].embedding;
+
+            const { error: insertError } = await supabase
+                .from('content_chunks')
+                .insert({
+                    source_id: sourceId,
+                    source_title: sourceTitle,
+                    chunk_content: chunk,
+                    embedding: embedding,
+                });
+
+            if (insertError) throw insertError;
+            
+            console.log(`[INGESTA] Chunk ${index + 1}/${chunks.length} insertado correctamente.`);
+            
+        } catch (e) {
+            console.error(`[INGESTA ERROR] Fallo al procesar/insertar chunk ${index + 1}:`, e);
+        }
     }
 }
