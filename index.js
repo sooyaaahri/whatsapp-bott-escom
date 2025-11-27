@@ -1,21 +1,25 @@
-require('dotenv').config();
+// server.js (CÓDIGO FINAL DE PRODUCCIÓN)
 const express = require('express');
 const bodyParser = require('body-parser');
 const dialogflow = require('@google-cloud/dialogflow');
-const uuid = require('uuid'); 
 const { createClient } = require('@supabase/supabase-js');
 const { OpenAI } = require('openai');
+const pdf = require('pdf-parse'); 
+require('dotenv').config(); 
 
+// --- 1. Inicialización de Clientes y Configuración ---
 const app = express();
 const port = process.env.PORT || 3000;
 
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+// Configuración de credenciales Supabase (usamos SERVICE_ROLE como fallback para RLS)
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
+const supabase = createClient(process.env.SUPABASE_URL, supabaseKey);
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// Configuración de Dialogflow
 const projectId = process.env.DIALOGFLOW_PROJECT_ID;
-const credentials = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+// El JSON de credenciales se parsea de la variable de entorno (para Heroku)
+const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON || '{}');
 const sessionClient = new dialogflow.SessionsClient({
     credentials: {
         client_email: credentials.client_email,
@@ -23,6 +27,15 @@ const sessionClient = new dialogflow.SessionsClient({
     },
 });
 
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
+
+
+// --- 2. Rutas del Servidor ---
+
+/**
+ * 2.1 WEBHOOK DE WHATSAPP (Conversación Principal)
+ */
 app.post('/webhook', async (req, res) => {
     const userMessage = req.body.Body;
     const fromNumber = req.body.From;
@@ -32,14 +45,12 @@ app.post('/webhook', async (req, res) => {
     try {
         const finalReply = await handleConversation(userMessage, fromNumber);
         
-        // Manejo del token de transferencia a humano
         const twimlReply = (finalReply === 'HANDOFF_TO_HUMAN')
             ? "Lo siento, la consulta requiere asistencia humana. Un agente se pondrá en contacto pronto."
             : finalReply;
 
         console.log(`[FIN] Respuesta final: "${twimlReply.substring(0, 50)}..."`);
 
-        // Respuesta TwiML XML (Formato Twilio Original)
         const twiml = `<Response><Message>${twimlReply}</Message></Response>`;
 
         res.set('Content-Type', 'text/xml');
@@ -62,11 +73,9 @@ app.post('/ingest-document', async (req, res) => {
         return res.status(400).send({ message: 'Missing document ID.' });
     }
 
-    // CRÍTICO: Ejecutar la función de ingesta en segundo plano (no usar await)
-    // Esto permite que Node.js responda inmediatamente a Retool.
+    // Ejecutar la ingesta en segundo plano (no usar await)
     processAndChunkDocument(documentId); 
 
-    // Responder inmediatamente con 202 Accepted.
     res.status(202).send({ message: `Ingesta iniciada para el documento ${documentId}. El procesamiento continuará en segundo plano.` });
 });
 
@@ -81,11 +90,7 @@ app.listen(port, () => {
 //                  LÓGICA DEL CEREBRO (CONVERSACIÓN)
 // =========================================================================
 
-/**
- * ORQUESTADOR: Maneja el flujo de Dialogflow -> RAG (Supabase + OpenAI)
- */
 async function handleConversation(query, senderId) {
-    
     const dialogflowResponse = await checkDialogflow(query, senderId);
     console.log(`[ORQUESTADOR] Dialogflow Intent: ${dialogflowResponse.intent}`);
     
@@ -107,10 +112,8 @@ async function handleConversation(query, senderId) {
 }
 
 
-/**
- * FILTRO DE BAJA LATENCIA (Dialogflow)
- */
 async function checkDialogflow(query, senderId) {
+    // Nota: El Session ID se toma del número de WhatsApp para mantener la memoria.
     const sessionPath = sessionClient.projectAgentSessionPath(projectId, senderId.replace('whatsapp:', ''));
     
     const request = { 
@@ -137,9 +140,6 @@ async function checkDialogflow(query, senderId) {
 }
 
 
-/**
- * BÚSQUEDA DE CONTEXTO (Supabase RPC)
- */
 async function getRagContext(query) {
     
     try {
@@ -150,6 +150,7 @@ async function getRagContext(query) {
         const queryEmbedding = embeddingResponse.data[0].embedding;
         console.log('[RAG] Embedding generado. Consultando RPC...');
 
+        // CRÍTICO: Llamada a la función PostgreSQL para la búsqueda vectorial
         const { data: knowledgeChunks, error } = await supabase.rpc('match_knowledge', {
             query_embedding: queryEmbedding,
             match_threshold: 0.75, 
@@ -181,20 +182,30 @@ async function getRagContext(query) {
 }
 
 
-/**
- * GENERACIÓN DE RESPUESTA (OpenAI con Prompt Estricto)
- */
 async function generateAiResponse(query, context) {
-    const systemPrompt = `Eres un experto de soporte. Responde la pregunta del cliente usando ÚNICAMENTE el CONTEXTO proporcionado. REGLA ESTRICTA: Si no puedes responder con el contexto, responde ÚNICAMENTE con la frase: "HANDOFF_TO_HUMAN". CONTEXTO DISPONIBLE: ---\n${context}\n---`;
+    const temperatureValue = parseFloat(process.env.OPENAI_TEMPERATURE) || 0.3; 
+    
+    const systemPrompt = `
+ROL: Eres un experto de soporte. Responde la pregunta del cliente usando ÚNICAMENTE el CONTEXTO proporcionado.
+
+REGLA CRÍTICA:
+1. Si la información del contexto indica una negación o restricción (ej. "no es responsable", "no aplica", "solo aplica a X"), ESA ES LA RESPUESTA VÁLIDA. Fórmulala directamente al usuario. No respondas HANDOFF.
+2. Si la información es insuficiente, contradictoria, o no existe en el contexto, y la pregunta no se puede responder, responde ÚNICAMENTE con la frase: "HANDOFF_TO_HUMAN".
+
+CONTEXTO DISPONIBLE:
+---
+${context}
+---
+`;
 
     try {
         const response = await openai.chat.completions.create({
-            model: "gpt-4o-mini", 
+            model: process.env.OPENAI_MODEL_ID || "gpt-4o-mini", 
             messages: [
                 { role: "system", content: systemPrompt },
                 { role: "user", content: query },
             ],
-            temperature: 0.1, 
+            temperature: temperatureValue, 
             max_tokens: 300,
         });
 
@@ -203,7 +214,7 @@ async function generateAiResponse(query, context) {
         return aiResponse;
 
     } catch (e) {
-        console.error("ERROR LLAMANDO A OPENAI:", e);
+        console.error('🛑 ERROR OPENAI CHAT COMPLETION:', e.response?.data || e.message || e);
         return "Hubo un error al consultar la IA.";
     }
 }
@@ -212,13 +223,9 @@ async function generateAiResponse(query, context) {
 //                  LÓGICA DE INGESTA (ASÍNCRONA)
 // =========================================================================
 
-/**
- * Orquesta la descarga, fragmentación, vectorización e inserción de un documento.
- */
 async function processAndChunkDocument(documentId) {
     console.log(`[INGESTA] INICIANDO proceso para el documento ID: ${documentId}`);
     
-    // 1. OBTENER METADATOS Y CONTENIDO
     const { data: source, error: sourceError } = await supabase
         .from('content_sources')
         .select('*')
@@ -236,12 +243,13 @@ async function processAndChunkDocument(documentId) {
     if (source.source_type === 'text') {
         fullText = source.original_content;
     } 
-    else if (source.source_type === 'file' && source.file_path) {
+    else if (source.source_type === 'file' && source.file_url) {
         try {
-            console.log(`[INGESTA] Tipo 'file' detectado. Descargando desde: ${source.file_path}`);
+            console.log(`[INGESTA] Tipo 'file' detectado. Descargando desde: ${source.file_url}`);
             
-            // Lógica para descargar PDF y parsear... (Asumimos que el bucket es 'knowledge-docs')
-            const { data: fileData } = await supabase.storage.from('knowledge-docs').download(source.file_path);
+            // Lógica para descargar PDF y parsear... 
+            // Se usa el bucket 'knowledge-docs' como ejemplo.
+            const { data: fileData } = await supabase.storage.from('knowledge-docs').download(source.file_url);
             const dataBuffer = await fileData.arrayBuffer();
             const pdfData = await pdf(Buffer.from(dataBuffer));
             fullText = pdfData.text;
@@ -251,7 +259,7 @@ async function processAndChunkDocument(documentId) {
             return;
         }
     } else {
-        console.error(`[INGESTA ERROR] Tipo de fuente desconocido o ruta de archivo faltante.`);
+        console.error(`[INGESTA ERROR] Tipo de fuente desconocido o URL de archivo faltante.`);
         return;
     }
 
