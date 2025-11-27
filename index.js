@@ -160,7 +160,17 @@ async function getRagContext(query) {
         }
         if (!knowledgeChunks || knowledgeChunks.length === 0) return null;
 
-        const context = knowledgeChunks.map(chunk => `Título: ${chunk.source_title}\nContenido: ${chunk.chunk_content}`).join('\n---\n');
+        // 3. CONSTRUIR EL CONTEXTO (Corregimos el alias y añadimos defensa)
+        const context = knowledgeChunks.map(chunk => {
+            // Usamos ?? '' para manejar nulls y strings vacías de forma segura.
+            const title = chunk.source_title ?? 'N/A'; 
+            
+            // 🔥 CORRECCIÓN CLAVE: Usamos 'chunk.content' que es el alias devuelto por el RPC.
+            const content = chunk.content ?? ''; 
+            
+            return `Título: ${title}\nContenido: ${content}`;
+        }).join('\n---\n');
+
         return context;
     } catch (e) {
         console.error("ERROR EN RAG/SUPABASE:", e);
