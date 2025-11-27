@@ -1,25 +1,32 @@
-// server.js (CÓDIGO FINAL DE PRODUCCIÓN)
+// server.js (CÓDIGO CONSERVANDO ESTRUCTURA ORIGINAL Y TwiML)
+require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const dialogflow = require('@google-cloud/dialogflow');
+const uuid = require('uuid'); // Se mantiene
 const { createClient } = require('@supabase/supabase-js');
 const { OpenAI } = require('openai');
-const pdf = require('pdf-parse'); 
-require('dotenv').config(); 
+const pdf = require('pdf-parse'); // Necesario para la ingesta
 
-// --- 1. Inicialización de Clientes y Configuración ---
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Configuración de credenciales Supabase (usamos SERVICE_ROLE como fallback para RLS)
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(bodyParser.json());
+
+// --- INICIALIZACIÓN DE CLIENTES (Cambios Mínimos) ---
+
+// 1. Cliente Supabase (Ajuste para usar Service Role Key y bypassar RLS)
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
 const supabase = createClient(process.env.SUPABASE_URL, supabaseKey);
+
+// 2. Cliente OpenAI
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// Configuración de Dialogflow
+// 3. Cliente Dialogflow (AJUSTE CRÍTICO: Leer JSON de ENV para Heroku)
 const projectId = process.env.DIALOGFLOW_PROJECT_ID;
-// El JSON de credenciales se parsea de la variable de entorno (para Heroku)
 const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON || '{}');
+
 const sessionClient = new dialogflow.SessionsClient({
     credentials: {
         client_email: credentials.client_email,
@@ -27,34 +34,35 @@ const sessionClient = new dialogflow.SessionsClient({
     },
 });
 
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+// --- RUTA PRINCIPAL ---
 
-
-// --- 2. Rutas del Servidor ---
-
-/**
- * 2.1 WEBHOOK DE WHATSAPP (Conversación Principal)
- */
 app.post('/webhook', async (req, res) => {
     const userMessage = req.body.Body;
-    const fromNumber = req.body.From;
+    const fromNumber = req.body.From; // Usado como senderId
 
     console.log(`[INICIO] Mensaje de ${fromNumber}: "${userMessage.substring(0, 50)}..."`);
 
     try {
+        // La lógica de RAG y Dialogflow se ejecuta aquí
         const finalReply = await handleConversation(userMessage, fromNumber);
         
+        // Manejo del token de transferencia a humano
         const twimlReply = (finalReply === 'HANDOFF_TO_HUMAN')
             ? "Lo siento, la consulta requiere asistencia humana. Un agente se pondrá en contacto pronto."
             : finalReply;
 
         console.log(`[FIN] Respuesta final: "${twimlReply.substring(0, 50)}..."`);
 
-        const twiml = `<Response><Message>${twimlReply}</Message></Response>`;
+        // --- RESPUESTA TWIML ORIGINAL DEL USUARIO ---
+        const twiml = `
+            <Response>
+                <Message>${twimlReply}</Message>
+            </Response>
+        `;
 
         res.set('Content-Type', 'text/xml');
         res.send(twiml);
+        // ------------------------------------------
 
     } catch (err) {
         console.error('ERROR CRÍTICO EN EL PROCESO RAG/WEBHOOK:', err);
@@ -63,7 +71,7 @@ app.post('/webhook', async (req, res) => {
 });
 
 /**
- * 2.2 RUTA DE INGESTA (Disparada por Retool al subir un documento)
+ * RUTA DE INGESTA (Para Retool)
  */
 app.post('/ingest-document', async (req, res) => {
     const documentId = req.body.id;
@@ -73,23 +81,23 @@ app.post('/ingest-document', async (req, res) => {
         return res.status(400).send({ message: 'Missing document ID.' });
     }
 
-    // Ejecutar la ingesta en segundo plano (no usar await)
+    // Ejecutar la ingesta en segundo plano
     processAndChunkDocument(documentId); 
 
     res.status(202).send({ message: `Ingesta iniciada para el documento ${documentId}. El procesamiento continuará en segundo plano.` });
 });
 
 
-// --- 3. Inicio del Servidor ---
 app.listen(port, () => {
     console.log(`Webhook de WhatsApp + Dialogflow + RAG escuchando en el puerto ${port}`);
 });
 
 
 // =========================================================================
-//                  LÓGICA DEL CEREBRO (CONVERSACIÓN)
+//                  LÓGICA DEL CEREBRO (FUNCIONALIDADES)
 // =========================================================================
 
+// --- ORQUESTADOR ---
 async function handleConversation(query, senderId) {
     const dialogflowResponse = await checkDialogflow(query, senderId);
     console.log(`[ORQUESTADOR] Dialogflow Intent: ${dialogflowResponse.intent}`);
@@ -111,46 +119,35 @@ async function handleConversation(query, senderId) {
     return "HANDOFF_TO_HUMAN";
 }
 
-
+// --- FILTRO DIALOGFLOW ---
 async function checkDialogflow(query, senderId) {
-    // Nota: El Session ID se toma del número de WhatsApp para mantener la memoria.
+    // CRÍTICO: Usamos el número de WhatsApp como Session ID para mantener la conversación,
+    // corrigiendo el uso de uuid.v4() en cada mensaje, que borraba la memoria.
     const sessionPath = sessionClient.projectAgentSessionPath(projectId, senderId.replace('whatsapp:', ''));
     
-    const request = { 
-        session: sessionPath, 
-        queryInput: { 
-            text: { text: query, languageCode: 'es-ES' } 
-        } 
-    };
+    const request = { session: sessionPath, queryInput: { text: { text: query, languageCode: 'es-ES' } } };
 
     try {
         const responses = await sessionClient.detectIntent(request);
         const result = responses[0].queryResult;
         const intentName = result.intent ? result.intent.displayName : 'Default Fallback Intent';
         
-        return { 
-            intent: intentName, 
-            text: result.fulfillmentText, 
-            isFallback: (intentName === 'Default Fallback Intent') 
-        };
+        return { intent: intentName, text: result.fulfillmentText, isFallback: (intentName === 'Default Fallback Intent') };
     } catch (e) {
         console.error('ERROR DIALOGFLOW:', e);
         return { intent: 'API_ERROR', text: "Error de clasificación.", isFallback: true };
     }
 }
 
-
+// --- BÚSQUEDA DE CONTEXTO (RAG) ---
 async function getRagContext(query) {
-    
     try {
         const embeddingResponse = await openai.embeddings.create({
             model: "text-embedding-3-small", 
             input: query,
         });
         const queryEmbedding = embeddingResponse.data[0].embedding;
-        console.log('[RAG] Embedding generado. Consultando RPC...');
 
-        // CRÍTICO: Llamada a la función PostgreSQL para la búsqueda vectorial
         const { data: knowledgeChunks, error } = await supabase.rpc('match_knowledge', {
             query_embedding: queryEmbedding,
             match_threshold: 0.75, 
@@ -161,42 +158,21 @@ async function getRagContext(query) {
             console.error('ERROR RPC SUPABASE:', error);
             return null;
         }
+        if (!knowledgeChunks || knowledgeChunks.length === 0) return null;
 
-        if (!knowledgeChunks || knowledgeChunks.length === 0) {
-            console.log('[RAG] RPC OK. Resultado: 0 chunks encontrados.');
-            return null;
-        }
-
-        console.log(`[RAG] RPC OK. Chunks encontrados: ${knowledgeChunks.length}`);
-
-        const context = knowledgeChunks.map(chunk => 
-            `Título: ${chunk.source_title}\nContenido: ${chunk.content}`
-        ).join('\n---\n');
-
+        const context = knowledgeChunks.map(chunk => `Título: ${chunk.source_title}\nContenido: ${chunk.chunk_content}`).join('\n---\n');
         return context;
-
     } catch (e) {
         console.error("ERROR EN RAG/SUPABASE:", e);
         return null;
     }
 }
 
-
+// --- GENERACIÓN DE RESPUESTA (OpenAI) ---
 async function generateAiResponse(query, context) {
     const temperatureValue = parseFloat(process.env.OPENAI_TEMPERATURE) || 0.3; 
     
-    const systemPrompt = `
-ROL: Eres un experto de soporte. Responde la pregunta del cliente usando ÚNICAMENTE el CONTEXTO proporcionado.
-
-REGLA CRÍTICA:
-1. Si la información del contexto indica una negación o restricción (ej. "no es responsable", "no aplica", "solo aplica a X"), ESA ES LA RESPUESTA VÁLIDA. Fórmulala directamente al usuario. No respondas HANDOFF.
-2. Si la información es insuficiente, contradictoria, o no existe en el contexto, y la pregunta no se puede responder, responde ÚNICAMENTE con la frase: "HANDOFF_TO_HUMAN".
-
-CONTEXTO DISPONIBLE:
----
-${context}
----
-`;
+    const systemPrompt = `ROL: Eres un experto de soporte. Responde la pregunta del cliente usando ÚNICAMENTE el CONTEXTO proporcionado. REGLA CRÍTICA: Si no puedes responder, responde ÚNICAMENTE con la frase: "HANDOFF_TO_HUMAN". CONTEXTO DISPONIBLE: ---\n${context}\n---`;
 
     try {
         const response = await openai.chat.completions.create({
@@ -209,69 +185,38 @@ ${context}
             max_tokens: 300,
         });
 
-        const aiResponse = response.choices[0].message.content.trim();
-        console.log(`[OpenAI] Respuesta generada. ¿Transferencia?: ${aiResponse === 'HANDOFF_TO_HUMAN' ? 'Sí' : 'No'}`);
-        return aiResponse;
-
+        return response.choices[0].message.content.trim();
     } catch (e) {
-        console.error('🛑 ERROR OPENAI CHAT COMPLETION:', e.response?.data || e.message || e);
+        console.error('🛑 ERROR LLAMANDO A OPENAI:', e);
         return "Hubo un error al consultar la IA.";
     }
 }
 
-// =========================================================================
-//                  LÓGICA DE INGESTA (ASÍNCRONA)
-// =========================================================================
+// --- LÓGICA DE INGESTA (ASÍNCRONA) ---
 
 async function processAndChunkDocument(documentId) {
-    console.log(`[INGESTA] INICIANDO proceso para el documento ID: ${documentId}`);
-    
-    const { data: source, error: sourceError } = await supabase
-        .from('content_sources')
-        .select('*')
-        .eq('id', documentId)
-        .single();
+    const { data: source } = await supabase.from('content_sources').select('*').eq('id', documentId).single();
+    if (!source) return;
 
-    if (sourceError || !source) {
-        console.error(`[INGESTA ERROR] No se pudo obtener la fuente ${documentId}:`, sourceError);
-        return;
-    }
-
-    let fullText = '';
+    let fullText = source.source_type === 'text' ? source.original_content : '';
     const SOURCE_TITLE = source.title;
     
-    if (source.source_type === 'text') {
-        fullText = source.original_content;
-    } 
-    else if (source.source_type === 'file' && source.file_url) {
+    if (source.source_type === 'file' && source.file_url) {
         try {
-            console.log(`[INGESTA] Tipo 'file' detectado. Descargando desde: ${source.file_url}`);
-            
-            // Lógica para descargar PDF y parsear... 
-            // Se usa el bucket 'knowledge-docs' como ejemplo.
             const { data: fileData } = await supabase.storage.from('knowledge-docs').download(source.file_url);
             const dataBuffer = await fileData.arrayBuffer();
             const pdfData = await pdf(Buffer.from(dataBuffer));
             fullText = pdfData.text;
-            
-        } catch (downloadOrParseError) {
-            console.error('[INGESTA ERROR] Fallo al descargar o parsear PDF:', downloadOrParseError);
+        } catch (e) {
+            console.error('[INGESTA ERROR] Fallo al descargar o parsear PDF:', e);
             return;
         }
-    } else {
-        console.error(`[INGESTA ERROR] Tipo de fuente desconocido o URL de archivo faltante.`);
-        return;
     }
 
     if (!fullText) return console.log('[INGESTA] Texto vacío. Cancelando.');
     
-    // 2. CHUNKING (Fragmentación del Texto)
     const chunks = simpleChunker(fullText, 1000, 200);
-    console.log(`[INGESTA] Texto dividido en ${chunks.length} fragmentos.`);
-    
-    // 3. GENERACIÓN DE EMBEDDINGS E INSERCIÓN
     await insertChunksWithEmbeddings(documentId, SOURCE_TITLE, chunks);
-    
     console.log(`[INGESTA] FINALIZADO el proceso para el documento ID: ${documentId}`);
 }
 
@@ -284,12 +229,9 @@ function simpleChunker(text, chunkSize, overlap) {
 }
 
 async function insertChunksWithEmbeddings(sourceId, sourceTitle, chunks) {
-    const { error: deleteError } = await supabase.from('content_chunks').delete().eq('source_id', sourceId);
-    if (deleteError) console.error('[INGESTA ERROR] No se pudieron eliminar chunks viejos:', deleteError);
-    
-    console.log(`[INGESTA] Eliminados chunks previos para source_id: ${sourceId}`);
+    await supabase.from('content_chunks').delete().eq('source_id', sourceId);
 
-    for (const [index, chunk] of chunks.entries()) {
+    for (const chunk of chunks) {
         try {
             const embeddingResponse = await openai.embeddings.create({
                 model: "text-embedding-3-small",
@@ -297,21 +239,14 @@ async function insertChunksWithEmbeddings(sourceId, sourceTitle, chunks) {
             });
             const embedding = embeddingResponse.data[0].embedding;
 
-            const { error: insertError } = await supabase
-                .from('content_chunks')
-                .insert({
+            await supabase.from('content_chunks').insert({
                     source_id: sourceId,
                     source_title: sourceTitle,
                     chunk_content: chunk,
                     embedding: embedding,
                 });
-
-            if (insertError) throw insertError;
-            
-            console.log(`[INGESTA] Chunk ${index + 1}/${chunks.length} insertado correctamente.`);
-            
         } catch (e) {
-            console.error(`[INGESTA ERROR] Fallo al procesar/insertar chunk ${index + 1}:`, e);
+            console.error(`[INGESTA ERROR] Fallo al procesar/insertar chunk:`, e);
         }
     }
 }
