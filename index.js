@@ -150,8 +150,8 @@ async function getRagContext(query) {
 
         const { data: knowledgeChunks, error } = await supabase.rpc('match_knowledge', {
             query_embedding: queryEmbedding,
-            match_threshold: 0.75, 
-            match_count: 3,        
+            match_threshold: 0.50, 
+            match_count: 5,        
         });
         
         if (error) {
