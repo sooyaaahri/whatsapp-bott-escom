@@ -205,29 +205,72 @@ async function generateAiResponse(query, context) {
 // --- LÓGICA DE INGESTA (ASÍNCRONA) ---
 
 async function processAndChunkDocument(documentId) {
-    const { data: source } = await supabase.from('content_sources').select('*').eq('id', documentId).single();
-    if (!source) return;
+    console.log(`[INGESTA] INICIANDO proceso para el documento ID: ${documentId}`);
+    
+    // 1. OBTENER DATOS DE LA DB
+    const { data: source, error: sourceError } = await supabase
+        .from('content_sources')
+        .select('*')
+        .eq('id', documentId)
+        .single();
 
-    let fullText = source.source_type === 'text' ? source.original_content : '';
+    if (sourceError || !source) {
+        console.error(`[INGESTA ERROR] No se pudo obtener la fuente de la BD:`, sourceError);
+        return;
+    }
+
+    let fullText = '';
     const SOURCE_TITLE = source.title;
     
-    if (source.source_type === 'file' && source.file_url) {
+    // CASO TEXTO
+    if (source.source_type === 'text') {
+        fullText = source.original_content;
+    } 
+    // CASO ARCHIVO (Aquí está el error)
+    else if (source.source_type === 'file' && source.file_url) {
         try {
-            const { data: fileData } = await supabase.storage.from('knowledge-docs').download(source.file_url);
+            console.log(`[INGESTA DEBUG] Intentando descargar del Bucket: 'knowledge-docs'`);
+            console.log(`[INGESTA DEBUG] Nombre del archivo (Path): '${source.file_url}'`);
+            
+            // --- CAMBIO IMPORTANTE: Capturamos el error de descarga ---
+            const { data: fileData, error: downloadError } = await supabase.storage
+                .from('knowledge-docs') // <--- VERIFICA QUE TU BUCKET SE LLAME ASÍ
+                .download(source.file_url);
+
+            if (downloadError) {
+                console.error('[INGESTA ERROR CRÍTICO] Supabase no encontró el archivo:', downloadError);
+                return; // Detenemos aquí para no crashear
+            }
+
+            if (!fileData) {
+                console.error('[INGESTA ERROR] La descarga fue exitosa pero el archivo está vacío (null).');
+                return;
+            }
+
+            // Si llegamos aquí, el archivo existe. Procesamos.
             const dataBuffer = await fileData.arrayBuffer();
             const pdfData = await pdf(Buffer.from(dataBuffer));
             fullText = pdfData.text;
+            
         } catch (e) {
-            console.error('[INGESTA ERROR] Fallo al descargar o parsear PDF:', e);
+            console.error('[INGESTA ERROR] Excepción al procesar PDF:', e);
             return;
         }
+    } else {
+        console.log('[INGESTA] Tipo de fuente desconocido o URL vacía.');
+        return;
     }
 
-    if (!fullText) return console.log('[INGESTA] Texto vacío. Cancelando.');
+    if (!fullText || fullText.trim().length === 0) {
+        console.log('[INGESTA] Texto extraído vacío. Cancelando proceso.');
+        return;
+    }
     
     const chunks = simpleChunker(fullText, 1000, 200);
+    console.log(`[INGESTA] Texto extraído (${fullText.length} chars). Creando ${chunks.length} chunks...`);
+    
     await insertChunksWithEmbeddings(documentId, SOURCE_TITLE, chunks);
-    console.log(`[INGESTA] FINALIZADO el proceso para el documento ID: ${documentId}`);
+    console.log(`[INGESTA] FINALIZADO EXITOSAMENTE ID: ${documentId}`);
 }
 
 function simpleChunker(text, chunkSize, overlap) {
