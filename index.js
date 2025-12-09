@@ -6,7 +6,7 @@ const dialogflow = require('@google-cloud/dialogflow');
 const uuid = require('uuid'); // Se mantiene
 const { createClient } = require('@supabase/supabase-js');
 const { OpenAI } = require('openai');
-const pdf = require('pdf-parse'); // Necesario para la ingesta
+const pdfParse = require('pdf-parse');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -48,7 +48,7 @@ app.post('/webhook', async (req, res) => {
         
         // Manejo del token de transferencia a humano
         const twimlReply = (finalReply === 'HANDOFF_TO_HUMAN')
-            ? "Lo siento, la consulta requiere asistencia humana. Un agente se pondrá en contacto pronto."
+            ? "Lo siento, la consulta no pudo ser procesada. Por favor consulta directamente con la CATT."
             : finalReply;
 
         console.log(`[FIN] Respuesta final: "${twimlReply.substring(0, 50)}..."`);
@@ -249,7 +249,7 @@ async function processAndChunkDocument(documentId) {
 
             // Si llegamos aquí, el archivo existe. Procesamos.
             const dataBuffer = await fileData.arrayBuffer();
-            const pdfData = await pdf(Buffer.from(dataBuffer));
+            const pdfData = await pdfParse(Buffer.from(dataBuffer));
             fullText = pdfData.text;
             
         } catch (e) {
