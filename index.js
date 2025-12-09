@@ -6,7 +6,7 @@ const dialogflow = require('@google-cloud/dialogflow');
 const uuid = require('uuid'); // Se mantiene
 const { createClient } = require('@supabase/supabase-js');
 const { OpenAI } = require('openai');
-const pdf = require('pdf-parse');
+const { PDFParse } = require('pdf-parse');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -248,10 +248,23 @@ async function processAndChunkDocument(documentId) {
             }
 
             // Si llegamos aquí, el archivo existe. Procesamos.
-            const dataBuffer = await fileData.arrayBuffer();
-            const pdfData = await pdf(Buffer.from(dataBuffer));
+            const arrayBuffer = await fileData.arrayBuffer();
+            const dataBuffer = Buffer.from(arrayBuffer);
 
-            fullText = pdfData.text;
+            // Creamos el parser con el buffer del PDF
+            const parser = new PDFParse({ data: dataBuffer });
+
+            try {
+                const result = await parser.getText();
+
+                fullText = result.text || '';
+            } finally {
+                try {
+                    await parser.destroy();
+                } catch (e) {
+                    console.warn('[INGESTA WARNING] Error al destruir parser PDF:', e);
+                }
+            }
         } catch (e) {
             console.error('[INGESTA ERROR] Excepción al procesar PDF:', e);
             return;
