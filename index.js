@@ -6,7 +6,7 @@ const dialogflow = require('@google-cloud/dialogflow');
 const uuid = require('uuid'); // Se mantiene
 const { createClient } = require('@supabase/supabase-js');
 const { OpenAI } = require('openai');
-const { pdfParse } = require('pdf-parse');
+const pdf = require('pdf-parse');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -249,13 +249,9 @@ async function processAndChunkDocument(documentId) {
 
             // Si llegamos aquí, el archivo existe. Procesamos.
             const dataBuffer = await fileData.arrayBuffer();
-            const buffer = Buffer.from(dataBuffer);
+            const pdfData = await pdf(Buffer.from(dataBuffer));
 
-            const parser = new PDFParse(buffer);
-            const result = await parser.getText();
-            pdfText = result.text;
-
-            fullText = pdfText;
+            fullText = pdfData.text;
         } catch (e) {
             console.error('[INGESTA ERROR] Excepción al procesar PDF:', e);
             return;
