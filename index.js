@@ -202,7 +202,7 @@ async function generateAiResponse(query, context) {
                 { role: "user", content: query },
             ],
             temperature: temperatureValue, 
-            max_tokens: 300,
+            max_tokens: 700,
         });
 
         return response.choices[0].message.content.trim();
