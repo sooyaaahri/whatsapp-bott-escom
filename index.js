@@ -87,11 +87,9 @@ app.post('/ingest-document', async (req, res) => {
     res.status(202).send({ message: `Ingesta iniciada para el documento ${documentId}. El procesamiento continuará en segundo plano.` });
 });
 
-
 app.listen(port, () => {
     console.log(`Webhook de WhatsApp + Dialogflow + RAG escuchando en el puerto ${port}`);
 });
-
 
 // =========================================================================
 //                  LÓGICA DEL CEREBRO (FUNCIONALIDADES)
@@ -182,7 +180,7 @@ async function getRagContext(query) {
 async function generateAiResponse(query, context) {
     const temperatureValue = parseFloat(process.env.OPENAI_TEMPERATURE) || 0.3; 
     
-    const systemPrompt = `ROL: Eres un experto de soporte. Responde la pregunta del cliente usando ÚNICAMENTE el CONTEXTO proporcionado. REGLA CRÍTICA: Si no puedes responder, responde ÚNICAMENTE con la frase: "HANDOFF_TO_HUMAN". CONTEXTO DISPONIBLE: ---\n${context}\n---`;
+    const systemPrompt = `ROL: Eres un asistente de soporte experto en trámites escolares del IPN ESCOM. Tu objetivo es ser breve, claro, formal y responder ÚNICAMENTE con la información que se te proporcione en el campo 'CONTEXTO'. Eres un experto en filtrar el ruido. Si la respuesta a la PREGUNTA no está en el CONTEXTO, tu respuesta DEBE ser el token 'HANDOFF_TO_HUMAN'. CONTEXTO DISPONIBLE: ---\n${context}\n---`;
 
     try {
         const response = await openai.chat.completions.create({
